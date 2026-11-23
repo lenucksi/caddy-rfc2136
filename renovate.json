@@ -48,6 +48,16 @@
     },
     {
       "customType": "regex",
+      "description": "golang.org/x/net Version-Override (CVE-Fix)",
+      "managerFilePatterns": ["/^Dockerfile$/"],
+      "matchStrings": [
+        "ARG XNET_VERSION=(?<currentValue>v\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "go",
+      "depNameTemplate": "golang.org/x/net"
+    },
+    {
+      "customType": "regex",
       "description": "events-exec Modul ist auf einen Commit gepinnt",
       "managerFilePatterns": ["/^Dockerfile$/"],
       "matchStrings": [
