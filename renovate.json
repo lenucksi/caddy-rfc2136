@@ -16,7 +16,7 @@
   "packageRules": [
     {
       "description": "Patch/Minor/Digest/Pin auto-mergen, sobald die Required Checks gruen sind",
-      "matchUpdateTypes": ["patch", "minor", "digest", "pin", "lockFile"],
+      "matchUpdateTypes": ["patch", "minor", "digest", "pin"],
       "automerge": true
     },
     {
