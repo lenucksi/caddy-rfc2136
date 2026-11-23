@@ -1,0 +1,187 @@
+name: Build signed Caddy (RFC2136 DNS-01)
+
+# Kein stumpfes Main-Tracking:
+#  - pull_request: nur Checks (Required Status Checks fuer Renovate-Automerge)
+#  - push main:    Renovate hat Pins gebumpt -> bauen, publizieren, signieren
+#  - schedule:     taeglich NUR PRUEFEN; rebuild/push nur wenn sich der
+#                  upstream Base-Digest geaendert hat (CVE-/OS-Fixes)
+#  - dispatch:     manuell
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - renovate.json
+      - .github/workflows/build.yml
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CADDY_VERSION: '2.11.9'
+  IMAGE: ghcr.io/lenucksi/caddy-rfc2136
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.decide.outputs.publish }}
+      base_digest: ${{ steps.base.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Login to GHCR (nur fuer Inspect des aktuellen Images)
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream base digest
+        id: base
+        run: |
+          set -euo pipefail
+          D=$(docker buildx imagetools inspect "caddy:${CADDY_VERSION}-alpine" \
+                --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "Base-Digest: $D"
+
+      - name: Build local (load for scanning)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          load: true
+          provenance: false
+          push: false
+          build-args: |
+            CADDY_VERSION=${{ env.CADDY_VERSION }}
+            BASE_DIGEST=${{ steps.base.outputs.digest }}
+          tags: caddy-rfc2136:verify
+
+      - name: Gate 1 - required modules present
+        run: |
+          set -euo pipefail
+          docker run --rm caddy-rfc2136:verify list-modules --skip-standard | tee /tmp/modules.txt
+          grep -q 'dns.providers.rfc2136' /tmp/modules.txt
+          grep -q 'events.handlers.exec' /tmp/modules.txt
+
+      - name: Gate 2 - Trivy (HIGH/CRITICAL, fixbar)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: caddy-rfc2136:verify
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Decide whether to publish
+        id: decide
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Event != schedule -> publish"
+            exit 0
+          fi
+          CURRENT=$(docker buildx imagetools inspect "${IMAGE}:${CADDY_VERSION}" \
+                      --format '{{index .Image.Config.Labels "org.opencontainers.image.base.digest"}}' \
+                      2>/dev/null || echo "none")
+          echo "Current base label: $CURRENT"
+          if [ "$CURRENT" != "${{ steps.base.outputs.digest }}" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "Base geaendert -> rebuild + publish"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Keine Aenderung -> kein Push"
+          fi
+
+  publish:
+    needs: verify
+    if: needs.verify.outputs.publish == 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          push: true
+          provenance: false
+          build-args: |
+            CADDY_VERSION=${{ env.CADDY_VERSION }}
+            BASE_DIGEST=${{ needs.verify.outputs.base_digest }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.CADDY_VERSION }}
+            ${{ env.IMAGE }}:2
+
+      - name: Resolve pushed digest
+        id: meta
+        run: |
+          set -euo pipefail
+          D=$(docker buildx imagetools inspect "${IMAGE}:${CADDY_VERSION}" --format '{{.Manifest.Digest}}')
+          echo "digest=$D" >> "$GITHUB_OUTPUT"
+          echo "Pushed digest: $D"
+
+      - name: Install cosign (fixed 3.1.3 for legacy .sig format)
+        uses: sigstore/cosign-installer@v4.1.3
+        with:
+          cosign-release: v3.1.3
+
+      - name: Sign by digest with our key (legacy .sig, Podman-policy compatible)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cosign sign --key env://COSIGN_PRIVATE_KEY --yes \
+            --new-bundle-format=false \
+            --registry-referrers-mode=legacy \
+            --use-signing-config=false \
+            "${IMAGE}@${{ steps.meta.outputs.digest }}"
+
+      - name: Verify signature with committed public key
+        run: |
+          set -euo pipefail
+          cosign verify --key cosign.pub \
+            --new-bundle-format=false \
+            "${IMAGE}@${{ steps.meta.outputs.digest }}"
+
+      - name: SLSA build provenance (public, additional)
+        uses: actions/attest@v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.meta.outputs.digest }}
+          push-to-registry: true
+        continue-on-error: true
