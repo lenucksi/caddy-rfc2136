@@ -73,7 +73,7 @@ jobs:
       - name: Gate 1 - required modules present
         run: |
           set -euo pipefail
-          docker run --rm caddy-rfc2136:verify list-modules --skip-standard | tee /tmp/modules.txt
+          docker run --rm --entrypoint caddy caddy-rfc2136:verify list-modules --skip-standard | tee /tmp/modules.txt
           grep -q 'dns.providers.rfc2136' /tmp/modules.txt
           grep -q 'events.handlers.exec' /tmp/modules.txt
 
